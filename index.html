@@ -163,6 +163,26 @@
     color: #999;
   }
 
+  /* 同步 */
+  .sync-box {
+    margin-top: 34px;
+    padding: 16px 18px;
+    background: #fff;
+    border: 1px dashed #d8d4cc;
+    border-radius: 12px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 12px;
+    font-size: 0.9em;
+    color: #666;
+  }
+  .sync-box .sync-state { flex: 1; min-width: 0; }
+  .sync-box .sync-state b { color: #2c2c2c; font-weight: 600; }
+  .sync-ok { color: #2f7d4f !important; }
+  .sync-err { color: #b03a2e !important; }
+  .sync-actions { margin-top: 8px; display: flex; flex-direction: column; gap: 12px; }
+
   /* 移动端 */
   @media (max-width: 480px) {
     #app { padding: 24px 16px 60px; }
@@ -180,6 +200,11 @@
     <div class="home-actions">
       <button class="btn btn-primary" onclick="showView('create')">存入回忆</button>
       <button class="btn btn-secondary" onclick="showView('list')">查看回忆</button>
+    </div>
+
+    <div class="sync-box" id="home-sync-box">
+      <div class="sync-state" id="home-sync-state">同步未开启 · 仅保存在本机</div>
+      <button class="btn-small" onclick="showView('sync')" id="home-sync-btn">开启同步</button>
     </div>
   </section>
 
@@ -231,6 +256,31 @@
   <section id="detail-view" class="view hidden">
     <div id="detail-content"></div>
     <button class="btn btn-secondary" onclick="showView('list')" style="margin-top:20px;">返回列表</button>
+  </section>
+
+  <!-- 跨设备同步 -->
+  <section id="sync-view" class="view hidden">
+    <h2>跨设备同步</h2>
+    <p class="hint" style="margin-bottom:22px;">
+      在每台设备上填写<b>同一段同步口令</b>，即可看到彼此的胶囊。
+      口令只用来区分你的数据空间，本身不会上传；胶囊内容仍由解锁密码加密，服务器只能看到密文。
+    </p>
+
+    <div>
+      <label>同步口令</label>
+      <input type="text" id="sync-code" maxlength="64" placeholder="例如：我和小雨的时光机-2026" style="margin-top:6px;">
+      <p class="hint">自定义任意文字，越长越难猜。请记牢，丢了无法找回云端数据。</p>
+    </div>
+
+    <div class="sync-actions">
+      <button class="btn btn-primary" onclick="enableSync()">保存口令并立即同步</button>
+      <button class="btn btn-secondary" onclick="syncNow().then(refreshSyncUI)">立即同步一次</button>
+      <button class="btn btn-secondary" onclick="disableSync()">本机关闭同步</button>
+    </div>
+
+    <div id="sync-status" class="hint" style="margin-top:16px; min-height:20px;"></div>
+
+    <button class="btn btn-secondary" onclick="showView('home')" style="margin-top:12px;">返回</button>
   </section>
 
 </div>
@@ -352,13 +402,219 @@ function formatDate(ts) {
 }
 
 /* ============================================
-   视图切换
+   跨设备同步（Supabase）
+   表结构：capsules(id text pk, created_at timestamptz, space_id text, payload text)
+   payload 里只有密文与时间戳，服务器看不到明文。
    ============================================ */
+const SB_URL = 'https://kqdrivwvzlyptxyykujt.supabase.co';
+const SB_KEY = 'sb_publishable_dKWqmoWpwZF2dCqGvklWMQ_tFYyDGoS';
+const SYNC_CODE_KEY = 'tc_sync_code';
+const SYNC_MAX_CHARS = 8 * 1024 * 1024; // 单条超过约 8MB 只留本机
+
+function getSyncCode() {
+  try { return localStorage.getItem(SYNC_CODE_KEY) || ''; } catch (e) { return ''; }
+}
+
+function setSyncCode(code) {
+  try {
+    if (code) localStorage.setItem(SYNC_CODE_KEY, code);
+    else localStorage.removeItem(SYNC_CODE_KEY);
+  } catch (e) { /* 隐私模式下忽略 */ }
+}
+
+function normalizeCode(code) {
+  return String(code || '').trim().toLowerCase().replace(/\s+/g, ' ');
+}
+
+async function spaceIdFor(code) {
+  const norm = normalizeCode(code);
+  const data = new TextEncoder().encode('time-capsule/v1/' + norm);
+  const buf = await crypto.subtle.digest('SHA-256', data);
+  return Array.from(new Uint8Array(buf))
+    .map(b => b.toString(16).padStart(2, '0'))
+    .join('');
+}
+
+function bytesToB64(x) {
+  let u8;
+  if (x instanceof ArrayBuffer) u8 = new Uint8Array(x);
+  else u8 = new Uint8Array(x.buffer, x.byteOffset || 0, x.byteLength);
+  return arrayBufferToBase64(u8.buffer.slice(u8.byteOffset, u8.byteOffset + u8.byteLength));
+}
+
+function b64ToBytes(b64) {
+  const bin = atob(b64);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+function memoryToRow(memory, spaceId) {
+  return {
+    id: memory.id,
+    space_id: spaceId,
+    payload: JSON.stringify({
+      createdAt: memory.createdAt,
+      unlockAt: memory.unlockAt,
+      salt: bytesToB64(memory.salt),
+      iv: bytesToB64(memory.iv),
+      ciphertext: bytesToB64(memory.ciphertext)
+    })
+  };
+}
+
+function rowToMemory(row) {
+  const p = JSON.parse(row.payload);
+  return {
+    id: row.id,
+    createdAt: p.createdAt,
+    unlockAt: p.unlockAt,
+    salt: b64ToBytes(p.salt),
+    iv: b64ToBytes(p.iv),
+    ciphertext: b64ToBytes(p.ciphertext)
+  };
+}
+
+async function sbFetch(path, options) {
+  const opts = options || {};
+  const res = await fetch(SB_URL + '/rest/v1/' + path, {
+    method: opts.method || 'GET',
+    headers: Object.assign({
+      'apikey': SB_KEY,
+      'Authorization': 'Bearer ' + SB_KEY,
+      'Content-Type': 'application/json'
+    }, opts.headers || {}),
+    body: opts.body
+  });
+  if (!res.ok) {
+    let detail = '';
+    try { detail = (await res.text()).slice(0, 160); } catch (e) {}
+    throw new Error('HTTP ' + res.status + (detail ? ' · ' + detail : ''));
+  }
+  return res;
+}
+
+async function pushToCloud(memory, spaceId) {
+  const row = memoryToRow(memory, spaceId);
+  if (row.payload.length > SYNC_MAX_CHARS) return { skipped: true };
+  await sbFetch('capsules', {
+    method: 'POST',
+    headers: { 'Prefer': 'resolution=ignore-duplicates,return=minimal' },
+    body: JSON.stringify(row)
+  });
+  return { skipped: false };
+}
+
+function setSyncStatus(text, kind) {
+  const el = document.getElementById('sync-status');
+  if (el) {
+    el.textContent = text;
+    el.className = 'hint' + (kind === 'ok' ? ' sync-ok' : kind === 'err' ? ' sync-err' : '');
+  }
+  const homeText = document.getElementById('home-sync-state');
+  if (homeText && kind) {
+    homeText.textContent = text;
+    homeText.className = 'sync-state' + (kind === 'ok' ? ' sync-ok' : kind === 'err' ? ' sync-err' : '');
+  }
+  const homeBox = document.getElementById('home-sync-box');
+  if (homeBox && kind) {
+    homeBox.setAttribute('data-state', kind);
+  }
+}
+
+async function syncNow() {
+  const code = getSyncCode();
+  if (!code) {
+    refreshSyncUI();
+    return { configured: false };
+  }
+  setSyncStatus('同步中……');
+  try {
+    const spaceId = await spaceIdFor(code);
+    const res = await sbFetch('capsules?space_id=eq.' + encodeURIComponent(spaceId) + '&select=id,payload');
+    const rows = await res.json();
+
+    const remoteIds = new Set(rows.map(r => r.id));
+    const localBefore = await dbGetAll();
+    const localIds = new Set(localBefore.map(m => m.id));
+
+    let downloaded = 0;
+    for (const row of rows) {
+      if (localIds.has(row.id)) continue;
+      try { await dbPut(rowToMemory(row)); downloaded++; }
+      catch (e) { console.warn('跳过无法解析的云端记录', row.id, e); }
+    }
+
+    let uploaded = 0, skipped = 0;
+    for (const m of localBefore) {
+      if (remoteIds.has(m.id)) continue;
+      try {
+        const r = await pushToCloud(m, spaceId);
+        if (r.skipped) skipped++; else uploaded++;
+      } catch (e) { console.warn('上传失败', m.id, e); }
+    }
+
+    const total = localBefore.length + downloaded;
+    const parts = ['已同步 · 共 ' + total + ' 条'];
+    if (downloaded) parts.push('下载 ' + downloaded);
+    if (uploaded) parts.push('上传 ' + uploaded);
+    if (skipped) parts.push(skipped + ' 条过大仅本机');
+    setSyncStatus(parts.join(' · '), 'ok');
+    return { configured: true, total, downloaded, uploaded, skipped };
+  } catch (err) {
+    console.error(err);
+    setSyncStatus('同步失败：' + (err.message || err), 'err');
+    return { configured: true, error: String(err.message || err) };
+  }
+}
+
+function refreshSyncUI() {
+  const code = getSyncCode();
+  const input = document.getElementById('sync-code');
+  if (input && input.value !== code) input.value = code;
+
+  const homeState = document.getElementById('home-sync-state');
+  const homeBtn = document.getElementById('home-sync-btn');
+  if (homeState) {
+    if (code) {
+      homeState.textContent = '已开启同步 · 换设备填同一口令即可';
+      homeState.className = 'sync-state sync-ok';
+    } else {
+      homeState.textContent = '同步未开启 · 仅保存在本机';
+      homeState.className = 'sync-state';
+    }
+  }
+  if (homeBtn) homeBtn.textContent = code ? '同步设置' : '开启同步';
+}
+
+async function enableSync() {
+  const input = document.getElementById('sync-code');
+  const code = input ? input.value.trim() : '';
+  if (code.length < 4) {
+    setSyncStatus('同步口令至少 4 个字符', 'err');
+    return;
+  }
+  setSyncCode(code);
+  refreshSyncUI();
+  await syncNow();
+  refreshSyncUI();
+}
+
+async function disableSync() {
+  setSyncCode('');
+  refreshSyncUI();
+  setSyncStatus('本机已关闭同步。云端已有的数据不会被删除，重新填入口令即可再次同步。');
+}
+
 function showView(name) {
   document.querySelectorAll('.view').forEach(v => v.classList.add('hidden'));
   document.getElementById(name + '-view').classList.remove('hidden');
   window.scrollTo(0, 0);
   if (name === 'list') renderList();
+  if (name === 'list' && getSyncCode()) {
+    syncNow().then(() => { renderList(); refreshSyncUI(); });
+  }
+  if (name === 'home' || name === 'sync') refreshSyncUI();
 }
 
 /* ============================================
@@ -420,7 +676,21 @@ document.getElementById('create-form').addEventListener('submit', async e => {
 
     await dbPut(memory);
 
-    alert(`已存入，${days} 天后可查看。`);
+    // 5. 已开启同步则推到云端
+    let syncNote = '';
+    if (getSyncCode()) {
+      submitBtn.textContent = '正在同步……';
+      try {
+        const spaceId = await spaceIdFor(getSyncCode());
+        const r = await pushToCloud(memory, spaceId);
+        if (r.skipped) syncNote = '\n（内容较大，仅保存在本机，未上传云端）';
+      } catch (err) {
+        console.warn(err);
+        syncNote = '\n（云端同步失败，已保存在本机，稍后可在「同步」里重试）';
+      }
+    }
+
+    alert(`已存入，${days} 天后可查看。${syncNote}`);
     e.target.reset();
     showView('list');
   } catch (err) {
@@ -537,7 +807,11 @@ function renderDetail(data, memory) {
 /* ============================================
    初始化
    ============================================ */
+refreshSyncUI();
 showView('home');
+if (getSyncCode()) {
+  syncNow().then(() => { refreshSyncUI(); });
+}
 </script>
 </body>
 </html>
